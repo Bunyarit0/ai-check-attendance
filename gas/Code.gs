@@ -4,14 +4,19 @@
  * ตั้งค่าก่อนใช้งาน (Project Settings > Script properties):
  *   ADMIN_USER      ชื่อผู้ใช้ Super Admin (ไม่ตั้ง = "admin")
  *   ADMIN_PASSWORD  รหัสผ่าน Super Admin (ต้องตั้ง ไม่งั้นล็อกอิน Super Admin ไม่ได้)
+ *
+ * ชีตที่ใช้: Attendance, Admins, Pins (สร้างและซ่อนให้เอง), รายชื่อ (Students)
  */
 
 const TZ = "Asia/Bangkok";
 const SESSION_TTL_SEC = 6 * 60 * 60;   // 6 ชั่วโมง (สูงสุดของ CacheService)
 const MAX_LOGIN_FAILS = 5;
+const MAX_PIN_FAILS = 5;
 const LOGIN_LOCK_SEC = 15 * 60;        // ล็อก 15 นาทีเมื่อกรอกผิดครบ
 const MAX_PHOTO_CHARS = 3500000;       // ~2.6MB หลังถอด base64
 const PHOTO_MIME = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
+const ABSENCE_TYPES = ["", "ลา", "ติดกิจกรรม"];
+const HISTORY_LIMIT = 120;
 
 function doGet() {
   return HtmlService.createHtmlOutputFromFile('Index')
@@ -60,6 +65,10 @@ function safeCell_(v) {
   return /^[=+\-@\t\r]/.test(s) ? "'" + s : s;
 }
 
+function isChecked_(v) {
+  return String(v).indexOf("✅") !== -1 || String(v).toUpperCase() === "TRUE";
+}
+
 function getSuperCreds_() {
   const p = PropertiesService.getScriptProperties();
   return {
@@ -99,7 +108,6 @@ function failKey_(username) {
 
 /**
  * เข้าสู่ระบบ — สำเร็จจะได้ token ให้ส่งกลับมากับทุกคำสั่งของแอดมิน
- * @return {{success:boolean, role?:string, token?:string, message?:string}}
  */
 function verifyAdmin(username, password) {
   username = String(username || "").trim();
@@ -117,7 +125,6 @@ function verifyAdmin(username, password) {
 
   let result = null;
 
-  // Super Admin
   const sup = getSuperCreds_();
   if (!sup.pass && username === sup.user) {
     console.warn("ยังไม่ได้ตั้ง ADMIN_PASSWORD ใน Script properties");
@@ -138,7 +145,7 @@ function verifyAdmin(username, password) {
         if (hash) {
           if (safeEqual_(hashPassword_(salt, password), hash)) result = { role: "Co-Admin" };
         } else if (safeEqual_(String(data[i][1]), password)) {
-          // รูปแบบเก่า (รหัสผ่านเป็น plain text ในคอลัมน์ B) -> อัปเกรดเป็น hash ทันที
+          // รูปแบบเก่า (plain text คอลัมน์ B) -> อัปเกรดเป็น hash ทันที
           const newSalt = Utilities.getUuid();
           sheet.getRange(i + 1, 2, 1, 2).setValues([[newSalt, hashPassword_(newSalt, password)]]);
           result = { role: "Co-Admin" };
@@ -150,7 +157,7 @@ function verifyAdmin(username, password) {
 
   if (!result) {
     cache.put(key, String(fails + 1), LOGIN_LOCK_SEC);
-    Utilities.sleep(500); // หน่วงเล็กน้อยให้เดารหัสช้าลง
+    Utilities.sleep(500);
     return { success: false, message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" };
   }
 
@@ -167,7 +174,6 @@ function logoutAdmin(token) {
   return { success: true };
 }
 
-/** ตรวจว่า token ยังใช้ได้ไหม (ใช้ตอนเปิดหน้าซ้ำ) */
 function checkSession(token) {
   const s = getSession_(token);
   return s ? { success: true, role: s.role, username: s.username } : { success: false };
@@ -247,43 +253,32 @@ function removeAdmin(token, username) {
   }
 }
 
-/**
- * รันมือครั้งเดียวจาก Apps Script editor เพื่อแปลงรหัสผ่านเก่าในชีต Admins เป็น hash ทั้งหมด
- */
+/** รันมือครั้งเดียวเพื่อแปลงรหัสผ่านเก่าในชีต Admins เป็น hash ทั้งหมด */
 function migrateAdminPasswords() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Admins");
   if (!sheet) return;
   const data = sheet.getDataRange().getValues();
   sheet.getRange("A1:C1").setValues([["Username", "Salt", "Hash"]]);
   for (let i = 1; i < data.length; i++) {
-    if (!data[i][0] || data[i][2]) continue;          // ว่างหรือเป็น hash แล้ว
+    if (!data[i][0] || data[i][2]) continue;
     const plain = String(data[i][1]);
     const salt = Utilities.getUuid();
     sheet.getRange(i + 1, 2, 1, 2).setValues([[salt, hashPassword_(salt, plain)]]);
   }
 }
 
-/* ===================== Attendance ===================== */
+/* ===================== Roster ===================== */
 
-/**
- * (ไม่บังคับ) ถ้ามีชีต "Students" คอลัมน์ A = รายชื่อ จะอนุญาตเฉพาะชื่อในรายการ
- */
-function isKnownStudent_(ss, name) {
-  const list = readStudents_(ss);
-  return list.length === 0 || list.indexOf(name) !== -1;
-}
-
-// หาชีตรายชื่อ: รับ Students / students / รายชื่อ / รายชื่อนักเรียน (ไม่สนตัวพิมพ์เล็ก-ใหญ่และช่องว่างหัวท้าย)
+// หาชีตรายชื่อ: Students / รายชื่อ / รายชื่อนักเรียน (ไม่สนตัวพิมพ์) หรือชีตเดียวที่เหลือนอกจากชีตระบบ
 function findStudentSheet_(ss) {
   const wanted = ["students", "รายชื่อ", "รายชื่อนักเรียน"];
   const sheets = ss.getSheets();
   for (let i = 0; i < sheets.length; i++) {
     if (wanted.indexOf(sheets[i].getName().trim().toLowerCase()) !== -1) return sheets[i];
   }
-  // ไม่เจอชื่อตรง: ถ้ามีชีตอื่นนอกจาก Attendance/Admins เพียงชีตเดียว ใช้ชีตนั้นเป็นรายชื่อ
+  const system = ["attendance", "admins", "pins"];
   const others = sheets.filter(function (s) {
-    const n = s.getName().trim().toLowerCase();
-    return n !== "attendance" && n !== "admins";
+    return system.indexOf(s.getName().trim().toLowerCase()) === -1;
   });
   return others.length === 1 ? others[0] : null;
 }
@@ -296,40 +291,118 @@ function readStudents_(ss) {
     .filter(function (n) { return n; });
 }
 
-/**
- * รันมือจาก Apps Script editor (เลือกฟังก์ชัน debugSetup > Run) แล้วดูผลที่ Execution log
- * ใช้ตรวจว่าผูกกับสเปรดชีตถูกไหม มีชีตรายชื่อไหม และตั้งรหัสแอดมินแล้วหรือยัง (ไม่แสดงรหัสผ่าน)
- */
-function debugSetup() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss) {
-    console.log("❌ สคริปต์นี้ไม่ได้ผูกกับ Google Sheet — ต้องสร้างจาก Sheet > ส่วนขยาย > Apps Script");
-  } else {
-    console.log("✅ สเปรดชีต: " + ss.getName());
-    console.log("ชีตทั้งหมด: " + ss.getSheets().map(function (s) { return "[" + s.getName() + "]"; }).join(" "));
-    const st = readStudents_(ss);
-    console.log(st.length
-      ? "✅ พบรายชื่อนักเรียน " + st.length + " คน (คนแรก: " + st[0] + ")"
-      : "❌ ไม่พบรายชื่อ — ต้องมีชีตชื่อ Students และใส่ชื่อที่คอลัมน์ A");
+function isKnownStudent_(ss, name) {
+  const list = readStudents_(ss);
+  return list.length === 0 || list.indexOf(name) !== -1;
+}
+
+/** รายชื่อนักเรียนสำหรับ dropdown — สาธารณะ มีเฉพาะชื่อ */
+function getStudents() {
+  return readStudents_(SpreadsheetApp.getActiveSpreadsheet());
+}
+
+/* ===================== Student PIN ===================== */
+
+function getPinSheet_(ss, create) {
+  let sheet = ss.getSheetByName("Pins");
+  if (!sheet && create) {
+    sheet = ss.insertSheet("Pins");
+    sheet.appendRow(["Name", "Salt", "Hash", "Updated"]);
+    sheet.getRange("A1:D1").setFontWeight("bold").setBackground("#f8fafc");
+    sheet.hideSheet();
   }
-  const c = getSuperCreds_();
-  console.log("ADMIN_USER ที่ใช้ล็อกอิน: [" + c.user + "]");
-  console.log(c.pass
-    ? "✅ ตั้ง ADMIN_PASSWORD แล้ว (ความยาว " + c.pass.length + " ตัว; ถ้ามีเว้นวรรคหัวท้ายให้แก้)"
-    : "❌ ยังไม่ได้ตั้ง ADMIN_PASSWORD ใน Script properties");
+  return sheet;
+}
+
+function findPinRow_(sheet, name) {
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  const v = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  for (let i = 0; i < v.length; i++) {
+    if (String(v[i][0]).trim() === name) {
+      return { row: i + 2, salt: String(v[i][1]), hash: String(v[i][2]) };
+    }
+  }
+  return null;
+}
+
+function hashPin_(salt, name, pin) {
+  return sha256_(salt + ":" + name + ":" + pin);
 }
 
 /**
- * รายชื่อนักเรียนสำหรับ dropdown (ชีต "Students" คอลัมน์ A) — สาธารณะ ไม่มีข้อมูลอื่นนอกจากชื่อ
+ * ตรวจ PIN ของนักเรียน
+ * - allowCreate=true และยังไม่เคยตั้ง PIN -> ตั้งจาก PIN ที่ส่งมา (เรียกภายใน lock เท่านั้น)
+ * - ผิด 5 ครั้งล็อกชื่อนั้น 15 นาที (กรรมการรีเซ็ตได้)
  */
-function getStudents() {
-  return readStudents_(SpreadsheetApp.getActiveSpreadsheet());
+function checkPin_(ss, name, pin, allowCreate) {
+  const cache = CacheService.getScriptCache();
+  const key = "pinfail_" + sha256_(name);
+  const fails = Number(cache.get(key) || 0);
+  if (fails >= MAX_PIN_FAILS) {
+    return { ok: false, message: "กรอก PIN ผิดหลายครั้ง กรุณารอ 15 นาที หรือให้กรรมการรีเซ็ต PIN" };
+  }
+  pin = String(pin || "");
+  const cellName = safeCell_(name);
+  const sheet = getPinSheet_(ss, allowCreate);
+  const found = findPinRow_(sheet, cellName);
+
+  if (!found) {
+    if (!allowCreate) return { ok: false, needPin: true, message: "ยังไม่ได้ตั้ง PIN (ตั้งได้ตอนเช็คชื่อครั้งแรก)" };
+    if (!/^\d{4,6}$/.test(pin)) return { ok: false, message: "PIN ต้องเป็นตัวเลข 4-6 หลัก" };
+    const salt = Utilities.getUuid();
+    sheet.appendRow([cellName, salt, hashPin_(salt, cellName, pin), Utilities.formatDate(new Date(), TZ, "yyyy-MM-dd HH:mm")]);
+    return { ok: true, created: true };
+  }
+
+  if (safeEqual_(hashPin_(found.salt, cellName, pin), found.hash)) {
+    cache.remove(key);
+    return { ok: true };
+  }
+  cache.put(key, String(fails + 1), LOGIN_LOCK_SEC);
+  return { ok: false, message: "PIN ไม่ถูกต้อง" };
+}
+
+/** หน้าเว็บใช้ถามว่าชื่อนี้เคยตั้ง PIN แล้วหรือยัง (เพื่อเลือกแสดงช่องตั้ง/กรอก PIN) */
+function getPinStatus(name) {
+  name = String(name || "").trim();
+  if (!name || name.length > 100) return { hasPin: false };
+  const sheet = getPinSheet_(SpreadsheetApp.getActiveSpreadsheet(), false);
+  return { hasPin: !!findPinRow_(sheet, safeCell_(name)) };
+}
+
+/** กรรมการ (ทุกระดับ) รีเซ็ต PIN ของนักเรียน — นักเรียนจะตั้ง PIN ใหม่ตอนเช็คครั้งถัดไป */
+function resetStudentPin(token, name) {
+  if (!requireAdmin_(token, false)) return { success: false, message: "ไม่มีสิทธิ์ดำเนินการ" };
+  name = String(name || "").trim();
+  if (!name) return { success: false, message: "กรุณาเลือกชื่อ" };
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { success: false, message: "ระบบกำลังหนาแน่น กรุณาลองใหม่" };
+  try {
+    const sheet = getPinSheet_(SpreadsheetApp.getActiveSpreadsheet(), false);
+    const found = findPinRow_(sheet, safeCell_(name));
+    CacheService.getScriptCache().remove("pinfail_" + sha256_(name));
+    if (!found) return { success: true, message: "นักเรียนคนนี้ยังไม่ได้ตั้ง PIN" };
+    sheet.deleteRow(found.row);
+    return { success: true, message: "รีเซ็ต PIN แล้ว" };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ===================== Attendance ===================== */
+
+function ensureAttendanceHeaders_(sheet) {
+  if (String(sheet.getRange("I1").getValue()) === "") {
+    sheet.getRange("I1:J1").setValues([["ลา/กิจกรรม", "หมายเหตุ"]]).setFontWeight("bold").setBackground("#f8fafc");
+  }
 }
 
 /**
  * บันทึกการเช็คชื่อ
  * - วัน/เวลา: ใช้เวลาเซิร์ฟเวอร์เสมอ (แอดมินที่ล็อกอินเท่านั้นที่ระบุวันย้อนหลังได้)
- * - role: นักเรียนทั่วไป = "นักเรียน", แอดมิน = ชื่อบัญชีที่ล็อกอิน (ไม่เชื่อค่าจาก client)
+ * - นักเรียน: ต้องส่ง PIN (ครั้งแรกจะตั้ง PIN ให้จากค่าที่ส่งมา); แอดมิน: ใช้ token ไม่ต้อง PIN
+ * - สถานะพิเศษ: absence = "" | "ลา" | "ติดกิจกรรม" (+ note) — ไม่ต้องแนบรูป
  */
 function saveAttendance(data) {
   if (!data || typeof data !== "object") return { success: false, message: "ข้อมูลไม่ถูกต้อง" };
@@ -337,6 +410,10 @@ function saveAttendance(data) {
   const session = getSession_(data.token);
   const name = String(data.name || "").trim();
   if (!name || name.length > 100) return { success: false, message: "กรุณาเลือกชื่อ" };
+
+  const absence = String(data.absence || "");
+  if (ABSENCE_TYPES.indexOf(absence) === -1) return { success: false, message: "สถานะไม่ถูกต้อง" };
+  const note = safeCell_(String(data.note || "").substring(0, 200));
 
   const now = new Date();
   let date = Utilities.formatDate(now, TZ, "yyyy-MM-dd");
@@ -346,7 +423,13 @@ function saveAttendance(data) {
   const zone = data.zone === true || data.zone === "true";
   const line = data.line === true || data.line === "true";
   const duty = data.duty === true || data.duty === "true";
-  if (!zone && !line && !duty) return { success: false, message: "กรุณาเลือกสถานะอย่างน้อย 1 อย่าง" };
+  if (!zone && !line && !duty && !absence) {
+    return { success: false, message: "กรุณาเลือกสถานะอย่างน้อย 1 อย่าง" };
+  }
+
+  if (!session && !/^\d{4,6}$/.test(String(data.pin || ""))) {
+    return { success: false, message: "กรุณากรอก PIN (ตัวเลข 4-6 หลัก)" };
+  }
 
   const role = session ? session.username : "นักเรียน";
 
@@ -374,12 +457,21 @@ function saveAttendance(data) {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     if (!isKnownStudent_(ss, name)) return { success: false, message: "ไม่พบชื่อนี้ในรายชื่อ" };
 
+    let pinCreated = false;
+    if (!session) {
+      const p = checkPin_(ss, name, data.pin, true);
+      if (!p.ok) return { success: false, message: p.message };
+      pinCreated = !!p.created;
+    }
+
     let sheet = ss.getSheetByName("Attendance");
     if (!sheet) {
       sheet = ss.insertSheet("Attendance");
-      sheet.appendRow(["วันที่", "เวลา", "ชื่อ-นามสกุล", "เข้าเขต", "เข้าแถว", "ทำเวร", "ผู้บันทึก", "รูปลิงก์"]);
-      sheet.getRange("A1:H1").setFontWeight("bold").setBackground("#f8fafc");
+      sheet.appendRow(["วันที่", "เวลา", "ชื่อ-นามสกุล", "เข้าเขต", "เข้าแถว", "ทำเวร", "ผู้บันทึก", "รูปลิงก์", "ลา/กิจกรรม", "หมายเหตุ"]);
+      sheet.getRange("A1:J1").setFontWeight("bold").setBackground("#f8fafc");
       sheet.getRange("A:A").setNumberFormat("@");
+    } else {
+      ensureAttendanceHeaders_(sheet);
     }
 
     // หาแถวเดิมของวันเดียวกัน (อ่านเฉพาะคอลัมน์ A-C)
@@ -396,11 +488,11 @@ function saveAttendance(data) {
     }
 
     let existing = null;
-    if (rowIndex !== -1) existing = sheet.getRange(rowIndex, 1, 1, 8).getValues()[0];
+    if (rowIndex !== -1) existing = sheet.getRange(rowIndex, 1, 1, 10).getValues()[0];
 
-    // นักเรียนต้องมีรูปหลักฐาน (ในแถวใหม่ หรือมีอยู่แล้ว)
+    // นักเรียนต้องมีรูปหลักฐาน (ยกเว้นลา/ติดกิจกรรม หรือมีรูปอยู่แล้ว)
     const hasOldPhoto = existing && existing[7] && String(existing[7]) !== "-";
-    if (!session && !photoBlob && !hasOldPhoto) {
+    if (!session && !absence && !photoBlob && !hasOldPhoto) {
       return { success: false, message: "กรุณาถ่ายรูปหลักฐาน" };
     }
 
@@ -413,22 +505,30 @@ function saveAttendance(data) {
       photoUrl = file.getUrl();
     }
 
+    const absenceCell = absence || "-";
+    const noteCell = (absence && note) ? note : "-";
+
     if (existing) {
-      const z = String(existing[3]).indexOf("✅") !== -1 || zone;
-      const l = String(existing[4]).indexOf("✅") !== -1 || line;
-      const d = String(existing[5]).indexOf("✅") !== -1 || duty;
-      sheet.getRange(rowIndex, 2, 1, 7).setValues([[
-        time, existing[2], z ? "✅" : "-", l ? "✅" : "-", d ? "✅" : "-", role, photoUrl
+      const z = isChecked_(existing[3]) || zone;
+      const l = isChecked_(existing[4]) || line;
+      const d = isChecked_(existing[5]) || duty;
+      sheet.getRange(rowIndex, 2, 1, 9).setValues([[
+        time, existing[2], z ? "✅" : "-", l ? "✅" : "-", d ? "✅" : "-",
+        role, photoUrl, absenceCell, noteCell
       ]]);
     } else {
       sheet.appendRow([
         date, time, safeCell_(name),
         zone ? "✅" : "-", line ? "✅" : "-", duty ? "✅" : "-",
-        safeCell_(role), photoUrl
+        safeCell_(role), photoUrl, absenceCell, noteCell
       ]);
     }
 
-    return { success: true, message: "บันทึกข้อมูลสำเร็จเรียบร้อย" };
+    return {
+      success: true,
+      pinCreated: pinCreated,
+      message: pinCreated ? "บันทึกสำเร็จ และตั้ง PIN เรียบร้อยแล้ว" : "บันทึกข้อมูลสำเร็จเรียบร้อย"
+    };
   } catch (error) {
     console.error(error);
     return { success: false, message: "เกิดข้อผิดพลาดในระบบ กรุณาลองใหม่" };
@@ -438,7 +538,7 @@ function saveAttendance(data) {
 }
 
 /**
- * สถิติรายวัน — ทุกคนดูสถานะได้ แต่ลิงก์รูปและชื่อผู้บันทึกเห็นเฉพาะแอดมินที่ล็อกอิน
+ * สถิติรายวัน — ทุกคนเห็นสถานะ/ประเภทลา; ลิงก์รูป ผู้บันทึก และหมายเหตุ เห็นเฉพาะแอดมิน
  */
 function getDailyStats(dateStr, token) {
   try {
@@ -449,20 +549,22 @@ function getDailyStats(dateStr, token) {
     if (!sheet || sheet.getLastRow() < 2) return {};
 
     const isAdmin = !!getSession_(token);
-    // ใช้ getDisplayValues: ได้ข้อความล้วน (ไม่มี Date object ซึ่ง google.script.run ส่งกลับไม่ได้)
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getDisplayValues();
-    const checked = function (v) { return String(v).indexOf("✅") !== -1 || String(v).toUpperCase() === "TRUE"; };
+    // getDisplayValues: ข้อความล้วน (google.script.run ส่ง Date object กลับไม่ได้)
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 10).getDisplayValues();
     const result = {};
     for (let i = 0; i < data.length; i++) {
       if (normalizeDate(data[i][0]) !== target) continue;
       const studentName = String(data[i][2]).trim();
+      const absence = String(data[i][8]) === "-" ? "" : String(data[i][8]);
       result[studentName] = {
         time: String(data[i][1]),
-        zone: checked(data[i][3]),
-        line: checked(data[i][4]),
-        duty: checked(data[i][5]),
+        zone: isChecked_(data[i][3]),
+        line: isChecked_(data[i][4]),
+        duty: isChecked_(data[i][5]),
+        absence: absence,
         role: isAdmin ? String(data[i][6]) : "",
-        photo: isAdmin ? String(data[i][7]) : ""
+        photo: isAdmin ? String(data[i][7]) : "",
+        note: isAdmin && String(data[i][9]) !== "-" ? String(data[i][9]) : ""
       };
     }
     return result;
@@ -470,4 +572,69 @@ function getDailyStats(dateStr, token) {
     console.error(e);
     return {};
   }
+}
+
+/**
+ * ประวัติการเช็คของนักเรียนคนหนึ่ง (ต้องยืนยันด้วย PIN ของตัวเอง)
+ */
+function getMyHistory(name, pin) {
+  try {
+    name = String(name || "").trim();
+    if (!name || name.length > 100) return { success: false, message: "กรุณาเลือกชื่อ" };
+    if (!/^\d{4,6}$/.test(String(pin || ""))) return { success: false, message: "กรุณากรอก PIN (ตัวเลข 4-6 หลัก)" };
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (!isKnownStudent_(ss, name)) return { success: false, message: "ไม่พบชื่อนี้ในรายชื่อ" };
+
+    const p = checkPin_(ss, name, pin, false);
+    if (!p.ok) return { success: false, needPin: !!p.needPin, message: p.message };
+
+    const sheet = ss.getSheetByName("Attendance");
+    const items = [];
+    if (sheet && sheet.getLastRow() > 1) {
+      const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 10).getDisplayValues();
+      for (let i = data.length - 1; i >= 0 && items.length < HISTORY_LIMIT; i--) {
+        if (String(data[i][2]).trim() !== name) continue;
+        items.push({
+          date: normalizeDate(data[i][0]),
+          time: String(data[i][1]),
+          zone: isChecked_(data[i][3]),
+          line: isChecked_(data[i][4]),
+          duty: isChecked_(data[i][5]),
+          photo: String(data[i][7]),
+          absence: String(data[i][8]) === "-" ? "" : String(data[i][8]),
+          note: String(data[i][9]) === "-" ? "" : String(data[i][9])
+        });
+      }
+    }
+    return { success: true, items: items };
+  } catch (e) {
+    console.error(e);
+    return { success: false, message: "เกิดข้อผิดพลาดในระบบ กรุณาลองใหม่" };
+  }
+}
+
+/* ===================== Debug ===================== */
+
+/**
+ * รันมือจาก Apps Script editor แล้วดู Execution log
+ * ตรวจว่าผูกกับสเปรดชีตถูกไหม มีชีตรายชื่อไหม และตั้งรหัสแอดมินแล้วหรือยัง (ไม่แสดงรหัสผ่าน)
+ */
+function debugSetup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    console.log("❌ สคริปต์นี้ไม่ได้ผูกกับ Google Sheet — ต้องสร้างจาก Sheet > ส่วนขยาย > Apps Script");
+  } else {
+    console.log("✅ สเปรดชีต: " + ss.getName());
+    console.log("ชีตทั้งหมด: " + ss.getSheets().map(function (s) { return "[" + s.getName() + "]"; }).join(" "));
+    const st = readStudents_(ss);
+    console.log(st.length
+      ? "✅ พบรายชื่อนักเรียน " + st.length + " คน (คนแรก: " + st[0] + ")"
+      : "❌ ไม่พบรายชื่อ — ต้องมีชีตชื่อ Students และใส่ชื่อที่คอลัมน์ A");
+  }
+  const c = getSuperCreds_();
+  console.log("ADMIN_USER ที่ใช้ล็อกอิน: [" + c.user + "]");
+  console.log(c.pass
+    ? "✅ ตั้ง ADMIN_PASSWORD แล้ว (ความยาว " + c.pass.length + " ตัว; ถ้ามีเว้นวรรคหัวท้ายให้แก้)"
+    : "❌ ยังไม่ได้ตั้ง ADMIN_PASSWORD ใน Script properties");
 }
