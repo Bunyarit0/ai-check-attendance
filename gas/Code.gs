@@ -119,6 +119,9 @@ function verifyAdmin(username, password) {
 
   // Super Admin
   const sup = getSuperCreds_();
+  if (!sup.pass && username === sup.user) {
+    console.warn("ยังไม่ได้ตั้ง ADMIN_PASSWORD ใน Script properties");
+  }
   if (sup.pass && username === sup.user) {
     if (safeEqual_(sha256_(password), sha256_(sup.pass))) {
       result = { role: "Super Admin" };
@@ -266,24 +269,56 @@ function migrateAdminPasswords() {
  * (ไม่บังคับ) ถ้ามีชีต "Students" คอลัมน์ A = รายชื่อ จะอนุญาตเฉพาะชื่อในรายการ
  */
 function isKnownStudent_(ss, name) {
-  const sheet = ss.getSheetByName("Students");
-  if (!sheet || sheet.getLastRow() < 1) return true;
-  const names = sheet.getRange(1, 1, sheet.getLastRow(), 1).getValues();
-  for (let i = 0; i < names.length; i++) {
-    if (String(names[i][0]).trim() === name) return true;
+  const list = readStudents_(ss);
+  return list.length === 0 || list.indexOf(name) !== -1;
+}
+
+// หาชีตรายชื่อ: รับ Students / students / รายชื่อ / รายชื่อนักเรียน (ไม่สนตัวพิมพ์เล็ก-ใหญ่และช่องว่างหัวท้าย)
+function findStudentSheet_(ss) {
+  const wanted = ["students", "รายชื่อ", "รายชื่อนักเรียน"];
+  const sheets = ss.getSheets();
+  for (let i = 0; i < sheets.length; i++) {
+    if (wanted.indexOf(sheets[i].getName().trim().toLowerCase()) !== -1) return sheets[i];
   }
-  return false;
+  return null;
+}
+
+function readStudents_(ss) {
+  const sheet = findStudentSheet_(ss);
+  if (!sheet || sheet.getLastRow() < 1) return [];
+  return sheet.getRange(1, 1, sheet.getLastRow(), 1).getValues()
+    .map(function (r) { return String(r[0]).trim(); })
+    .filter(function (n) { return n; });
+}
+
+/**
+ * รันมือจาก Apps Script editor (เลือกฟังก์ชัน debugSetup > Run) แล้วดูผลที่ Execution log
+ * ใช้ตรวจว่าผูกกับสเปรดชีตถูกไหม มีชีตรายชื่อไหม และตั้งรหัสแอดมินแล้วหรือยัง (ไม่แสดงรหัสผ่าน)
+ */
+function debugSetup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    console.log("❌ สคริปต์นี้ไม่ได้ผูกกับ Google Sheet — ต้องสร้างจาก Sheet > ส่วนขยาย > Apps Script");
+  } else {
+    console.log("✅ สเปรดชีต: " + ss.getName());
+    console.log("ชีตทั้งหมด: " + ss.getSheets().map(function (s) { return "[" + s.getName() + "]"; }).join(" "));
+    const st = readStudents_(ss);
+    console.log(st.length
+      ? "✅ พบรายชื่อนักเรียน " + st.length + " คน (คนแรก: " + st[0] + ")"
+      : "❌ ไม่พบรายชื่อ — ต้องมีชีตชื่อ Students และใส่ชื่อที่คอลัมน์ A");
+  }
+  const c = getSuperCreds_();
+  console.log("ADMIN_USER ที่ใช้ล็อกอิน: [" + c.user + "]");
+  console.log(c.pass
+    ? "✅ ตั้ง ADMIN_PASSWORD แล้ว (ความยาว " + c.pass.length + " ตัว; ถ้ามีเว้นวรรคหัวท้ายให้แก้)"
+    : "❌ ยังไม่ได้ตั้ง ADMIN_PASSWORD ใน Script properties");
 }
 
 /**
  * รายชื่อนักเรียนสำหรับ dropdown (ชีต "Students" คอลัมน์ A) — สาธารณะ ไม่มีข้อมูลอื่นนอกจากชื่อ
  */
 function getStudents() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Students");
-  if (!sheet || sheet.getLastRow() < 1) return [];
-  return sheet.getRange(1, 1, sheet.getLastRow(), 1).getValues()
-    .map(function (r) { return String(r[0]).trim(); })
-    .filter(function (n) { return n; });
+  return readStudents_(SpreadsheetApp.getActiveSpreadsheet());
 }
 
 /**

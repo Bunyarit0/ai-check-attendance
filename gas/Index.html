@@ -501,6 +501,14 @@ window.addEventListener('DOMContentLoaded', () => {
     callServer('getStudents', [], list => {
         students = list || [];
         fillNames(students);
+    }, () => {
+        ['self-name', 'admin-name'].forEach(id => {
+            $(id).textContent = '';
+            const o = document.createElement('option');
+            o.value = '';
+            o.textContent = 'โหลดรายชื่อไม่สำเร็จ (ลอง Deploy เวอร์ชันใหม่ แล้วรีเฟรช)';
+            $(id).appendChild(o);
+        });
     });
 });
 </script>
