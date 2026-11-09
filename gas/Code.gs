@@ -280,7 +280,12 @@ function findStudentSheet_(ss) {
   for (let i = 0; i < sheets.length; i++) {
     if (wanted.indexOf(sheets[i].getName().trim().toLowerCase()) !== -1) return sheets[i];
   }
-  return null;
+  // ไม่เจอชื่อตรง: ถ้ามีชีตอื่นนอกจาก Attendance/Admins เพียงชีตเดียว ใช้ชีตนั้นเป็นรายชื่อ
+  const others = sheets.filter(function (s) {
+    const n = s.getName().trim().toLowerCase();
+    return n !== "attendance" && n !== "admins";
+  });
+  return others.length === 1 ? others[0] : null;
 }
 
 function readStudents_(ss) {
