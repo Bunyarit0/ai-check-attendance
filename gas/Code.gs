@@ -276,6 +276,17 @@ function isKnownStudent_(ss, name) {
 }
 
 /**
+ * รายชื่อนักเรียนสำหรับ dropdown (ชีต "Students" คอลัมน์ A) — สาธารณะ ไม่มีข้อมูลอื่นนอกจากชื่อ
+ */
+function getStudents() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Students");
+  if (!sheet || sheet.getLastRow() < 1) return [];
+  return sheet.getRange(1, 1, sheet.getLastRow(), 1).getValues()
+    .map(function (r) { return String(r[0]).trim(); })
+    .filter(function (n) { return n; });
+}
+
+/**
  * บันทึกการเช็คชื่อ
  * - วัน/เวลา: ใช้เวลาเซิร์ฟเวอร์เสมอ (แอดมินที่ล็อกอินเท่านั้นที่ระบุวันย้อนหลังได้)
  * - role: นักเรียนทั่วไป = "นักเรียน", แอดมิน = ชื่อบัญชีที่ล็อกอิน (ไม่เชื่อค่าจาก client)
