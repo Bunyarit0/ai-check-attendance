@@ -432,6 +432,9 @@ function loadStats() {
 
     callServer('getDailyStats', [date, adminToken], data => {
         setBusy(btn, false, 'ดูข้อมูล');
+        if (!data || typeof data !== 'object') {
+            return showToast('โหลดสถิติไม่สำเร็จ ลองใหม่อีกครั้ง');
+        }
         const ul = $('stats-list');
         ul.textContent = '';
 

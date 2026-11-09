@@ -449,18 +449,20 @@ function getDailyStats(dateStr, token) {
     if (!sheet || sheet.getLastRow() < 2) return {};
 
     const isAdmin = !!getSession_(token);
-    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getValues();
+    // ใช้ getDisplayValues: ได้ข้อความล้วน (ไม่มี Date object ซึ่ง google.script.run ส่งกลับไม่ได้)
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getDisplayValues();
+    const checked = function (v) { return String(v).indexOf("✅") !== -1 || String(v).toUpperCase() === "TRUE"; };
     const result = {};
     for (let i = 0; i < data.length; i++) {
       if (normalizeDate(data[i][0]) !== target) continue;
       const studentName = String(data[i][2]).trim();
       result[studentName] = {
-        time: data[i][1],
-        zone: String(data[i][3]).indexOf("✅") !== -1,
-        line: String(data[i][4]).indexOf("✅") !== -1,
-        duty: String(data[i][5]).indexOf("✅") !== -1,
-        role: isAdmin ? data[i][6] : "",
-        photo: isAdmin ? data[i][7] : ""
+        time: String(data[i][1]),
+        zone: checked(data[i][3]),
+        line: checked(data[i][4]),
+        duty: checked(data[i][5]),
+        role: isAdmin ? String(data[i][6]) : "",
+        photo: isAdmin ? String(data[i][7]) : ""
       };
     }
     return result;
